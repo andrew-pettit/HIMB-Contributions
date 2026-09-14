@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.RDataTmp*
+.Ruserdata
+*.RData
+*.rds
+.Renviron
+.env
+.DS_Store
