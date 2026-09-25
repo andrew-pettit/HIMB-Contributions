@@ -1,18 +1,18 @@
-# HIMB publications from OpenAlex: recent update
+# HIMB publications from OpenAlex
+# Current and previous calendar-year update
 #
-# Searches the current and previous calendar years for HIMB-related
-# publications. It saves:
+# This script:
+# 1. Searches OpenAlex from January 1 of the previous year through today.
+# 2. Identifies probable HIMB-related publications.
+# 3. Saves the recent search results.
+# 4. Combines them with the existing historical OpenAlex dataset.
+# 5. Deduplicates the combined dataset by OpenAlex ID.
 #
-# 1. The recent search results
-# 2. An updated OpenAlex dataset combining the recent results with the
-#    existing full historical OpenAlex dataset
-#
-# The script does not directly overwrite the master HIMB dataset.
+# If OpenAlex rate-limits the search, completed search terms are checkpointed.
+# Run the script again after the API allowance resets to resume.
 
 readRenviron("~/.Renviron")
 
-# Confirm that an OpenAlex API key is available.
-# The actual key remains in .Renviron and is not stored in this script.
 if (!nzchar(Sys.getenv("OPENALEX_API_KEY"))) {
   stop(
     paste(
@@ -61,6 +61,8 @@ EXISTING_OPENALEX_FILE <- "HIMB_OpenAlex_publications.csv"
 
 UPDATED_OPENALEX_FILE <- "HIMB_OpenAlex_publications_updated.csv"
 
+SEARCH_CHECKPOINT_FILE <- "OpenAlex_recent_search_checkpoint.rds"
+
 # ---------------------------------------------------------------------------
 # HIMB search terms
 # ---------------------------------------------------------------------------
@@ -83,7 +85,7 @@ himb_search_terms <- c(
 )
 
 # ---------------------------------------------------------------------------
-# Text-processing functions
+# Basic helper functions
 # ---------------------------------------------------------------------------
 
 normalize_text <- function(x) {
@@ -100,9 +102,6 @@ normalize_text <- function(x) {
     str_to_lower() |>
     str_squish()
 }
-
-# Normalize the search dictionary so capitalization and Hawaiian
-# punctuation variants do not interfere with matching.
 
 himb_detect_terms <- unique(
   normalize_text(
@@ -151,6 +150,10 @@ openalex_id <- function(w) {
     "^https://openalex.org/"
   )
 }
+
+# ---------------------------------------------------------------------------
+# Abstract reconstruction
+# ---------------------------------------------------------------------------
 
 reconstruct_abstract <- function(index) {
   if (
@@ -248,16 +251,27 @@ oa_get <- function(query, max_attempts = 8) {
       stop_for_status(response)
     }
     
-    Sys.sleep(
-      min(
-        60,
-        2^attempt
-      )
+    wait_time <- min(
+      60,
+      2^attempt
     )
+    
+    message(
+      "OpenAlex request failed with HTTP ",
+      status_code(response),
+      ". Waiting ",
+      wait_time,
+      " seconds before retrying..."
+    )
+    
+    Sys.sleep(wait_time)
   }
 }
 
-fetch_openalex <- function(search = NULL, filter = NULL) {
+fetch_openalex <- function(
+    search = NULL,
+    filter = NULL
+) {
   cursor <- "*"
   output <- list()
   
@@ -412,11 +426,11 @@ get_match_details <- function(w) {
 }
 
 # ---------------------------------------------------------------------------
-# Citation and output-formatting functions
+# Author functions
 # ---------------------------------------------------------------------------
 
-# OpenAlex supplies display names rather than reliably separated given and
-# family names. This is therefore a best-effort conversion.
+# OpenAlex usually provides display names instead of separate given and
+# family names. These conversions are therefore best-effort.
 
 apa_person <- function(display_name) {
   name <- str_squish(display_name)
@@ -453,8 +467,98 @@ apa_person <- function(display_name) {
   )
 }
 
+get_first_author_last <- function(author_names) {
+  author_names <- str_squish(
+    author_names
+  )
+  
+  author_names <- author_names[
+    !is.na(author_names) &
+      nzchar(author_names)
+  ]
+  
+  if (length(author_names) == 0) {
+    return(NA_character_)
+  }
+  
+  first_author <- author_names[[1]]
+  
+  # Handle names already formatted as "Last, First".
+  if (str_detect(first_author, ",")) {
+    return(
+      str_trim(
+        str_extract(
+          first_author,
+          "^[^,]+"
+        )
+      )
+    )
+  }
+  
+  name_parts <- str_split(
+    first_author,
+    "\\s+"
+  )[[1]]
+  
+  # Remove suffixes before extracting the family name.
+  if (length(name_parts) > 1) {
+    final_part <- str_to_lower(
+      str_remove_all(
+        tail(name_parts, 1),
+        "[^A-Za-z0-9]"
+      )
+    )
+    
+    if (
+      final_part %in%
+      c(
+        "jr",
+        "sr",
+        "ii",
+        "iii",
+        "iv"
+      )
+    ) {
+      name_parts <- head(
+        name_parts,
+        -1
+      )
+    }
+  }
+  
+  if (length(name_parts) == 0) {
+    return(NA_character_)
+  }
+  
+  tail(
+    name_parts,
+    1
+  )
+}
+
+get_first_author_last_from_string <- function(authors) {
+  if (
+    is.na(authors) ||
+    !nzchar(str_squish(authors))
+  ) {
+    return(NA_character_)
+  }
+  
+  author_names <- str_split(
+    authors,
+    "\\s*;\\s*"
+  )[[1]]
+  
+  get_first_author_last(
+    author_names
+  )
+}
+
 apa_authors <- function(names) {
-  names <- names[nzchar(names)]
+  names <- names[
+    !is.na(names) &
+      nzchar(names)
+  ]
   
   formatted <- map_chr(
     names,
@@ -493,6 +597,10 @@ apa_authors <- function(names) {
     formatted[n]
   )
 }
+
+# ---------------------------------------------------------------------------
+# Citation functions
+# ---------------------------------------------------------------------------
 
 page_range <- function(w) {
   first <- safe_chr(
@@ -550,10 +658,9 @@ build_apa_citation <- function(
     )
   )
   
-  # APA moves the title into the author position when no author is available.
-  
   title_piece <- ifelse(
-    has_authors && nzchar(title),
+    has_authors &&
+      nzchar(title),
     paste0(
       title,
       "."
@@ -571,7 +678,8 @@ build_apa_citation <- function(
   )
   
   if (
-    type %in% c(
+    type %in%
+    c(
       "article",
       "review",
       "editorial",
@@ -640,7 +748,14 @@ build_apa_citation <- function(
   )
 }
 
-works_to_df <- function(works, details) {
+# ---------------------------------------------------------------------------
+# Convert OpenAlex records into a table
+# ---------------------------------------------------------------------------
+
+works_to_df <- function(
+    works,
+    details
+) {
   rows <- map2(
     works,
     details,
@@ -653,6 +768,10 @@ works_to_df <- function(works, details) {
           ~ safe_chr(.x$author$display_name)
         )
       }
+      
+      first_author_last_name <- get_first_author_last(
+        author_names
+      )
       
       doi <- str_remove(
         safe_chr(w$doi),
@@ -684,6 +803,7 @@ works_to_df <- function(works, details) {
           author_names,
           collapse = "; "
         ),
+        first_author_last_name = first_author_last_name,
         authors_apa = authors_apa,
         journal = journal,
         volume = volume,
@@ -737,7 +857,7 @@ works_to_df <- function(works, details) {
 }
 
 # ---------------------------------------------------------------------------
-# Download recent candidate works
+# Download recent UH Manoa candidate works
 # ---------------------------------------------------------------------------
 
 message(
@@ -766,37 +886,137 @@ message(
 )
 
 # ---------------------------------------------------------------------------
-# Run recent global HIMB searches
+# Run targeted searches with checkpointing
 # ---------------------------------------------------------------------------
 
-message(
-  "Running recent HIMB-related metadata searches..."
-)
+if (file.exists(SEARCH_CHECKPOINT_FILE)) {
+  message(
+    "Loading previously completed search-term checkpoints..."
+  )
+  
+  search_checkpoint <- readRDS(
+    SEARCH_CHECKPOINT_FILE
+  )
+  
+  search_results <- search_checkpoint$results
+  search_completed <- search_checkpoint$completed
+  
+  if (
+    length(search_results) !=
+    length(himb_search_terms) ||
+    length(search_completed) !=
+    length(himb_search_terms)
+  ) {
+    stop(
+      paste(
+        "The existing search checkpoint is incompatible",
+        "with the current search-term list.",
+        "Delete",
+        SEARCH_CHECKPOINT_FILE,
+        "and run the script again."
+      )
+    )
+  }
+} else {
+  search_results <- vector(
+    "list",
+    length(himb_search_terms)
+  )
+  
+  search_completed <- rep(
+    FALSE,
+    length(himb_search_terms)
+  )
+}
 
-search_works <- himb_search_terms |>
-  map(
-    \(term) {
+for (i in seq_along(himb_search_terms)) {
+  if (search_completed[[i]]) {
+    message(
+      "Using checkpoint for search ",
+      i,
+      " of ",
+      length(himb_search_terms),
+      ": ",
+      himb_search_terms[[i]]
+    )
+    
+    next
+  }
+  
+  message(
+    "Running search ",
+    i,
+    " of ",
+    length(himb_search_terms),
+    ": ",
+    himb_search_terms[[i]]
+  )
+  
+  current_result <- tryCatch(
+    fetch_openalex(
+      search = himb_search_terms[[i]],
+      filter = DATE_FILTER
+    ),
+    error = function(e) {
       message(
-        "Searching OpenAlex for: ",
-        term
+        "Search failed for: ",
+        himb_search_terms[[i]]
       )
       
-      fetch_openalex(
-        search = term,
-        filter = DATE_FILTER
+      message(
+        "OpenAlex error: ",
+        conditionMessage(e)
       )
+      
+      NULL
     }
-  ) |>
-  flatten()
+  )
+  
+  if (is.null(current_result)) {
+    saveRDS(
+      list(
+        results = search_results,
+        completed = search_completed
+      ),
+      SEARCH_CHECKPOINT_FILE
+    )
+    
+    stop(
+      paste(
+        "OpenAlex stopped the search before all terms were completed.",
+        "Completed terms were saved to",
+        SEARCH_CHECKPOINT_FILE,
+        "Run this script again after the API allowance resets."
+      )
+    )
+  }
+  
+  search_results[[i]] <- current_result
+  search_completed[[i]] <- TRUE
+  
+  saveRDS(
+    list(
+      results = search_results,
+      completed = search_completed
+    ),
+    SEARCH_CHECKPOINT_FILE
+  )
+  
+  Sys.sleep(1)
+}
+
+search_works <- flatten(
+  search_results
+)
 
 message(
   "Downloaded ",
   length(search_works),
-  " records from the targeted searches before deduplication."
+  " targeted-search records before deduplication."
 )
 
 # ---------------------------------------------------------------------------
-# Combine and deduplicate candidate records
+# Combine and deduplicate candidates
 # ---------------------------------------------------------------------------
 
 candidates <- c(
@@ -821,7 +1041,7 @@ message(
 )
 
 # ---------------------------------------------------------------------------
-# Identify HIMB-related records
+# Identify probable HIMB publications
 # ---------------------------------------------------------------------------
 
 match_details <- map(
@@ -843,7 +1063,7 @@ himb_publications <- works_to_df(
 )
 
 # ---------------------------------------------------------------------------
-# Save the recent two-year results
+# Save recent results
 # ---------------------------------------------------------------------------
 
 write.csv(
@@ -871,12 +1091,12 @@ message(
 )
 
 # ---------------------------------------------------------------------------
-# Combine recent results with the existing full OpenAlex dataset
+# Combine recent results with the existing historical dataset
 # ---------------------------------------------------------------------------
 
 if (file.exists(EXISTING_OPENALEX_FILE)) {
   message(
-    "Combining the recent results with ",
+    "Combining recent results with ",
     EXISTING_OPENALEX_FILE,
     "..."
   )
@@ -887,14 +1107,60 @@ if (file.exists(EXISTING_OPENALEX_FILE)) {
     check.names = FALSE
   )
   
+  # Create or backfill first_author_last_name for historical records.
+  if (
+    !"first_author_last_name" %in%
+    names(existing_openalex)
+  ) {
+    existing_openalex <- existing_openalex |>
+      mutate(
+        first_author_last_name = map_chr(
+          authors,
+          get_first_author_last_from_string
+        )
+      ) |>
+      relocate(
+        first_author_last_name,
+        .after = authors
+      )
+  } else {
+    existing_first_authors <- as.character(
+      existing_openalex$first_author_last_name
+    )
+    
+    missing_first_author <- is.na(
+      existing_first_authors
+    ) |
+      str_squish(
+        ifelse(
+          is.na(existing_first_authors),
+          "",
+          existing_first_authors
+        )
+      ) == ""
+    
+    existing_openalex$first_author_last_name[
+      missing_first_author
+    ] <- map_chr(
+      existing_openalex$authors[
+        missing_first_author
+      ],
+      get_first_author_last_from_string
+    )
+  }
+  
   existing_ids <- unique(
-    existing_openalex$openalex_id[
-      nzchar(existing_openalex$openalex_id)
-    ]
+    as.character(
+      existing_openalex$openalex_id[
+        !is.na(existing_openalex$openalex_id) &
+          nzchar(existing_openalex$openalex_id)
+      ]
+    )
   )
   
   new_record_count <- sum(
-    !himb_publications$openalex_id %in% existing_ids
+    !himb_publications$openalex_id %in%
+      existing_ids
   )
   
   updated_openalex <- bind_rows(
@@ -912,6 +1178,10 @@ if (file.exists(EXISTING_OPENALEX_FILE)) {
     distinct(
       openalex_id,
       .keep_all = TRUE
+    ) |>
+    relocate(
+      first_author_last_name,
+      .after = authors
     ) |>
     arrange(
       desc(year),
@@ -937,7 +1207,7 @@ if (file.exists(EXISTING_OPENALEX_FILE)) {
   message(
     "Finished: found ",
     new_record_count,
-    " OpenAlex records not present in the previous dataset."
+    " records not present in the previous OpenAlex dataset."
   )
   
   message(
@@ -953,7 +1223,27 @@ if (file.exists(EXISTING_OPENALEX_FILE)) {
       EXISTING_OPENALEX_FILE,
       "was not found.",
       "The recent-results files were created,",
-      "but an updated combined OpenAlex dataset was not created."
+      "but the combined updated OpenAlex dataset was not created."
     )
   )
 }
+
+# ---------------------------------------------------------------------------
+# Remove the temporary checkpoint after successful completion
+# ---------------------------------------------------------------------------
+
+if (file.exists(SEARCH_CHECKPOINT_FILE)) {
+  checkpoint_removed <- file.remove(
+    SEARCH_CHECKPOINT_FILE
+  )
+  
+  if (checkpoint_removed) {
+    message(
+      "Removed the completed temporary search checkpoint."
+    )
+  }
+}
+
+message(
+  "Two-year OpenAlex update completed successfully."
+)
