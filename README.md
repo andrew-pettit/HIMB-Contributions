@@ -55,7 +55,7 @@ Each row in `HIMB_Master_deduplicated.csv` represents one publication or other r
 - **`type`** — Publication or document category.
 - **`url_doi`** — URL or DOI, when available.\
 - **`Source`** — Dataset or archive from which the record was obtained.
-- - **`citation`** — Formatted citation for the publication or document.
+- **`citation`** — Formatted citation for the publication or document.
 
 ## Coverage and limitations
 
